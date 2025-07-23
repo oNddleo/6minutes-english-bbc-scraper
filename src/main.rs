@@ -2,19 +2,19 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use chrono::Local;
+use futures::future::join_all;
 use scraper::{Html, Selector};
-use tokio::{self};
 
-const _6MINUTES_ENGLISH: &'static str =
-    "https://www.bbc.co.uk/programmes/p02pc9tn/episodes/downloads";
-const _6MINUTES_VOCABULARY: &'static str =
-    "https://www.bbc.co.uk/programmes/p02pc9xz/episodes/downloads";
-const _6MINUTES_GRAMMAR: &'static str =
-    "https://www.bbc.co.uk/programmes/p02pc9wq/episodes/downloads";
+const _6MINUTES_ENGLISH: &str = "https://www.bbc.co.uk/programmes/p02pc9tn/episodes/downloads";
+const _6MINUTES_VOCABULARY: &str = "https://www.bbc.co.uk/programmes/p02pc9xz/episodes/downloads";
+const _6MINUTES_GRAMMAR: &str = "https://www.bbc.co.uk/programmes/p02pc9wq/episodes/downloads";
 
 #[derive(Debug, Clone)]
 pub struct PodcastConfig {
@@ -31,7 +31,7 @@ pub struct PodcastDownloader {
 impl PodcastDownloader {
     fn new(name: &str, url: &str, folder: &str) -> io::Result<Self> {
         let download_folder = Path::new(folder).to_path_buf();
-        fs::create_dir_all(&download_folder)?; // Use create_dir_all instead of create_dir
+        fs::create_dir_all(&download_folder)?;
 
         let index_file = download_folder.join(".podcast_index");
 
@@ -58,7 +58,7 @@ impl PodcastDownloader {
 
         let html = response
             .text()
-            .await // Add await here
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         let document = Html::parse_document(&html);
@@ -73,8 +73,9 @@ impl PodcastDownloader {
                 if !href.contains("audio-nondrm-download-low")
                     && !self.is_already_downloaded(href)?
                 {
-                    let filename = self.extract_filename(element)?;
-                    download_tasks.push((href.to_string(), filename));
+                    if let Ok(filename) = self.extract_filename(element) {
+                        download_tasks.push((href.to_string(), filename));
+                    }
                 }
             }
         }
@@ -87,44 +88,47 @@ impl PodcastDownloader {
 
         println!("Found {} new episodes, downloading...", total);
 
-        // Use tokio tasks instead of threads for concurrent downloads
-        let mut handles = Vec::new();
-        let completed = Arc::new(Mutex::new(0));
-        let failed = Arc::new(Mutex::new(0));
+        // Use futures::future::join_all for concurrent downloads without spawning
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicUsize::new(0));
 
-        for (url, filename) in download_tasks {
-            let filepath = self.config.download_folder.join(&filename);
-            let index_file = self.index_file.clone();
-            let completed = Arc::clone(&completed);
-            let failed = Arc::clone(&failed);
+        let download_futures = download_tasks
+            .into_iter()
+            .map(|(url, filename)| {
+                let semaphore = Arc::clone(&semaphore);
+                let completed = Arc::clone(&completed);
+                let failed = Arc::clone(&failed);
+                let download_folder = self.config.download_folder.clone();
+                let index_file = self.index_file.clone();
 
-            let handle = tokio::spawn(async move {
-                match Self::download_file(&url, &filepath).await {
-                    Ok(_) => {
-                        if let Err(e) = Self::record_download(&index_file, &url) {
-                            eprintln!("Failed to record download: {}", e);
+                async move {
+                    let _permit = semaphore.acquire().await.unwrap();
+
+                    let filepath = download_folder.join(&filename);
+
+                    match Self::download_file(&url, &filepath).await {
+                        Ok(_) => {
+                            if let Err(e) = Self::record_download(&index_file, &url) {
+                                eprintln!("Failed to record download: {}", e);
+                            }
+                            let comp_count = completed.fetch_add(1, Ordering::SeqCst) + 1;
+                            println!("Downloaded {}/{}: {}", comp_count, total, filename);
                         }
-                        let mut comp = completed.lock().unwrap();
-                        *comp += 1;
-                        println!("Downloaded {}/{}: {}", *comp, total, filename);
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to download {}: {}", filename, e);
-                        *failed.lock().unwrap() += 1;
+                        Err(e) => {
+                            eprintln!("Failed to download {}: {}", filename, e);
+                            failed.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
                 }
-            });
-
-            handles.push(handle);
-        }
+            })
+            .collect::<Vec<_>>();
 
         // Wait for all downloads to complete
-        for handle in handles {
-            handle.await.unwrap();
-        }
+        join_all(download_futures).await;
 
-        let completed = *completed.lock().unwrap();
-        let failed = *failed.lock().unwrap();
+        let completed = completed.load(Ordering::SeqCst);
+        let failed = failed.load(Ordering::SeqCst);
 
         println!(
             "Download completed: {} succeeded, {} failed",
@@ -135,8 +139,10 @@ impl PodcastDownloader {
     }
 
     fn is_already_downloaded(&self, url: &str) -> io::Result<bool> {
-        let content = fs::read_to_string(&self.index_file)?;
-        Ok(content.contains(url))
+        match fs::read_to_string(&self.index_file) {
+            Ok(content) => Ok(content.contains(url)),
+            Err(_) => Ok(false),
+        }
     }
 
     fn extract_filename(&self, element: scraper::ElementRef) -> io::Result<String> {
@@ -156,7 +162,7 @@ impl PodcastDownloader {
     }
 
     async fn download_file(url: &str, path: &Path) -> io::Result<()> {
-        let response = reqwest::get(url)
+        let response = reqwest::get(format!("https:{}", url))
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
@@ -165,9 +171,7 @@ impl PodcastDownloader {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        // Write bytes to file synchronously
-        fs::write(path, bytes)?;
-
+        tokio::fs::write(path, bytes).await?;
         Ok(())
     }
 
@@ -181,7 +185,6 @@ impl PodcastDownloader {
     }
 }
 
-// Make main async
 #[tokio::main]
 async fn main() -> io::Result<()> {
     println!("BBC Scraper\n");
@@ -204,37 +207,26 @@ async fn main() -> io::Result<()> {
         },
     ];
 
-    // Process podcasts concurrently using tokio tasks
-    let mut handles = Vec::new();
-
+    // Process podcasts sequentially to avoid Send issues
     for config in podcasts {
-        let handle = tokio::spawn(async move {
-            match PodcastDownloader::new(
-                &config.name,
-                &config.url,
-                &config.download_folder.to_str().unwrap(),
-            ) {
-                Ok(downloader) => {
-                    println!("Starting downloader for {}...", config.name);
+        match PodcastDownloader::new(
+            &config.name,
+            &config.url,
+            &config.download_folder.to_str().unwrap(),
+        ) {
+            Ok(downloader) => {
+                println!("Starting downloader for {}...", config.name);
 
-                    if let Err(e) = downloader.download_episodes().await {
-                        eprintln!("Error downloading {}: {}", config.name, e);
-                    }
+                if let Err(e) = downloader.download_episodes().await {
+                    eprintln!("Error downloading {}: {}", config.name, e);
+                }
 
-                    println!("Finished {}", config.name);
-                }
-                Err(e) => {
-                    eprintln!("Failed to initialize {} downloader: {}", config.name, e);
-                }
+                println!("Finished {}", config.name);
             }
-        });
-
-        handles.push(handle);
-    }
-
-    // Wait for all podcast downloads to complete
-    for handle in handles {
-        handle.await.unwrap();
+            Err(e) => {
+                eprintln!("Failed to initialize {} downloader: {}", config.name, e);
+            }
+        }
     }
 
     println!("All podcast downloads completed!");
