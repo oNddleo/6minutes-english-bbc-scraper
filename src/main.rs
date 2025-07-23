@@ -131,7 +131,7 @@ impl PodcastDownloader {
         let failed = failed.load(Ordering::SeqCst);
 
         println!(
-            "Download completed: {} succeeded, {} failed",
+            "Download: {} completed, {} failed",
             completed, failed
         );
 
@@ -212,7 +212,7 @@ async fn main() -> io::Result<()> {
         match PodcastDownloader::new(
             &config.name,
             &config.url,
-            &config.download_folder.to_str().unwrap(),
+            config.download_folder.to_str().unwrap(),
         ) {
             Ok(downloader) => {
                 println!("Starting downloader for {}...", config.name);
